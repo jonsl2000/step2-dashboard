@@ -1,347 +1,500 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { STUDY_PLAN } from './data/studyPlan';
 import { getQuoteForDate } from './data/quotes';
-import { getDailyLog, upsertDailyLog, getTaskCompletions, toggleTaskCompletion, delayTask, getPomodorosForDate, getAllPomodoros, getAllDailyLogs } from './lib/supabase';
-import PomodoroTimer from './components/PomodoroTimer';
-import NBMETracker from './components/NBMETracker';
+import { getDailyLog, upsertDailyLog, getTaskCompletions, toggleTaskCompletion, delayTask, getPomodorosForDate, getAllPomodoros, getAllDailyLogs, getNBMEScores, addNBMEScore } from './lib/supabase';
 import StaghornFern from './components/StaghornFern';
 
-const d0=new Date(),TODAY=d0.getFullYear()+'-'+String(d0.getMonth()+1).padStart(2,'0')+'-'+String(d0.getDate()).padStart(2,'0');
+function localDateStr(d = new Date()) {
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+}
+const TODAY = localDateStr();
+function getDayData(date) { return STUDY_PLAN.find(d => d.date === date); }
+function daysToExam() {
+  const exam = new Date('2026-06-12'), now = new Date(); now.setHours(0,0,0,0);
+  return Math.max(0, Math.ceil((exam - now) / 86400000));
+}
+function offsetDate(dateStr, n) {
+  const d = new Date(dateStr + 'T12:00:00'); d.setDate(d.getDate() + n);
+  return localDateStr(d);
+}
+function fmtDate(dateStr) {
+  return new Date(dateStr + 'T12:00:00').toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric' });
+}
+function fmtShort(dateStr) {
+  return new Date(dateStr + 'T12:00:00').toLocaleDateString('en-US', { month:'short', day:'numeric' });
+}
+function exportCSV(logs) {
+  const header = 'Date,Hours,Anki Cards,Pomodoros,Notes\n';
+  const rows = logs.map(l => `${l.date},${l.hours_studied||0},${l.anki_cards||0},${l.pomodoros_completed||0},"${(l.notes||'').replace(/"/g,'""')}"`).join('\n');
+  const blob = new Blob([header+rows], {type:'text/csv'});
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+  a.download = 'step2_study_log.csv'; a.click();
+}
 
-const PHASE_STYLES = {
-  1: { bg: '#F5F0E8', accent: '#8B6B4A', dot: '#C4A882', label: 'Launch' },
-  2: { bg: '#EBF5EE', accent: '#3D7A4A', dot: '#82C4A0', label: 'Sierra Leone' },
-  3: { bg: '#FBF0E8', accent: '#C4703A', dot: '#E8A878', label: 'Deep Sprint' },
-  4: { bg: '#F0EBF5', accent: '#7A4A8B', dot: '#C4A0D8', label: 'Final Stretch' },
+const PH = {
+  1: { bg:'#FFF7F0', border:'#FFD9B8', accent:'#F97316', tag:'#FFF0E6', tagText:'#C2410C', name:'Launch' },
+  2: { bg:'#F0FFF4', border:'#B8EED0', accent:'#10B981', tag:'#E6FFF4', tagText:'#065F46', name:'Sierra Leone' },
+  3: { bg:'#FFF8F0', border:'#FFD9B8', accent:'#F97316', tag:'#FFF0E6', tagText:'#C2410C', name:'Deep Sprint' },
+  4: { bg:'#F5F0FF', border:'#DDD0FF', accent:'#7C3AED', tag:'#EDE9FF', tagText:'#4C1D95', name:'Final Stretch' },
 };
 
 const QUICK_LINKS = [
-  { name: 'UWorld', url: 'https://uworld.com', icon: '⚕' },
-  { name: 'Sketchy', url: 'https://sketchy.com', icon: '✏' },
-  { name: 'Amboss', url: 'https://amboss.com', icon: '◈' },
-  { name: 'NBME', url: 'https://nbme.org', icon: '📋' },
-  { name: 'Mehlman', url: 'https://drive.google.com', icon: '📄' },
+  { name:'UWorld', url:'https://uworld.com', short:'UW' },
+  { name:'Sketchy', url:'https://sketchy.com', short:'SK' },
+  { name:'Amboss', url:'https://amboss.com', short:'AM' },
+  { name:'NBME', url:'https://nbme.org', short:'NB' },
+  { name:'Mehlman', url:'https://drive.google.com', short:'ME' },
 ];
 
-function getDayData(date) { return STUDY_PLAN.find(d => d.date === date); }
-function getExamDaysToGo() {
-  const exam = new Date('2026-06-12');
-  const now = new Date(); now.setHours(0,0,0,0);
-  return Math.max(0, Math.ceil((exam - now) / 86400000));
-}
+const EXAM_JUMPS = [
+  { label:'Today', date: TODAY },
+  { label:'NBME 9', date:'2026-04-04' },
+  { label:'NBME 10', date:'2026-04-19' },
+  { label:'NBME 11', date:'2026-05-02' },
+  { label:'NBME 12', date:'2026-05-09' },
+  { label:'UWSA 1', date:'2026-05-16' },
+  { label:'NBME 13', date:'2026-05-23' },
+  { label:'NBME 14', date:'2026-05-30' },
+  { label:'UWSA 2', date:'2026-06-04' },
+  { label:'NBME 15', date:'2026-06-07' },
+  { label:'NBME 16', date:'2026-06-09' },
+  { label:'Free 120', date:'2026-06-10' },
+];
 
-export default function App() {
-  const [view, setView] = useState('today');
-  const [selectedDate, setSelectedDate] = useState(TODAY);
-  const [calMonth, setCalMonth] = useState(() => { const d = new Date(TODAY); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`; });
-  const [dayLog, setDayLog] = useState(null);
-  const [taskStates, setTaskStates] = useState({});
-  const [pomodoroCount, setPomodoroCount] = useState(0);
-  const [totalPomodoros, setTotalPomodoros] = useState(0);
-  const [hoursInput, setHoursInput] = useState('');
-  const [ankiInput, setAnkiInput] = useState('');
-  const [noteInput, setNoteInput] = useState('');
-  const [allLogs, setAllLogs] = useState([]);
-  const [saving, setSaving] = useState(false);
+const NBME_NAMES = ['NBME 9','NBME 10','NBME 11','NBME 12','NBME 13','NBME 14','NBME 15','NBME 16','UWSA 1','UWSA 2','Free 120'];
 
-  const dayData = getDayData(selectedDate);
-  const phase = dayData ? PHASE_STYLES[dayData.phase] : PHASE_STYLES[1];
-  const quote = getQuoteForDate(selectedDate);
-  const daysToGo = getExamDaysToGo();
-
+function PomodoroTimer({ currentDate, currentSystem, onComplete }) {
+  const [work, setWork] = useState(50);
+  const [brk, setBrk] = useState(5);
+  const [secs, setSecs] = useState(50*60);
+  const [running, setRunning] = useState(false);
+  const [isBreak, setIsBreak] = useState(false);
+  const [done, setDone] = useState(0);
+  const [showSet, setShowSet] = useState(false);
+  const ref = useRef(null);
+  const total = isBreak ? brk*60 : work*60;
+  const pct = ((total-secs)/total)*100;
+  const m = Math.floor(secs/60), s = secs%60;
+  const circ = 2*Math.PI*42;
+  const chime = useCallback(() => {
+    try {
+      const ctx = new (window.AudioContext||window.webkitAudioContext)();
+      [523,659,784,1047].forEach((f,i) => {
+        const o=ctx.createOscillator(), g=ctx.createGain();
+        o.connect(g); g.connect(ctx.destination);
+        o.frequency.value=f; o.type='sine';
+        g.gain.setValueAtTime(0,ctx.currentTime+i*0.15);
+        g.gain.linearRampToValueAtTime(0.12,ctx.currentTime+i*0.15+0.05);
+        g.gain.linearRampToValueAtTime(0,ctx.currentTime+i*0.15+0.4);
+        o.start(ctx.currentTime+i*0.15); o.stop(ctx.currentTime+i*0.15+0.5);
+      });
+    } catch(e){}
+  },[]);
   useEffect(() => {
-    if (!selectedDate) return;
-    Promise.all([getDailyLog(selectedDate), getTaskCompletions(selectedDate), getPomodorosForDate(selectedDate)]).then(([log, tasks, pomodoros]) => {
-      setDayLog(log);
-      setHoursInput(log?.hours_studied?.toString() || '');
-      setAnkiInput(log?.anki_cards?.toString() || '');
-      setNoteInput(log?.notes || '');
-      const taskMap = {};
-      tasks.forEach(t => { taskMap[t.task_index] = t; });
-      setTaskStates(taskMap);
-      setPomodoroCount(pomodoros.length);
-    });
-  }, [selectedDate]);
-
-  useEffect(() => {
-    Promise.all([getAllDailyLogs(), getAllPomodoros()]).then(([logs, pomodoros]) => {
-      setAllLogs(logs);
-      setTotalPomodoros(pomodoros.length);
-    });
-  }, []);
-
-  const handleTaskToggle = async (index, completed) => {
-    const result = await toggleTaskCompletion(selectedDate, index, completed);
-    if (result) setTaskStates(prev => ({ ...prev, [index]: result }));
-  };
-
-  const handleDelayTask = async (index) => {
-    const currentIdx = STUDY_PLAN.findIndex(d => d.date === selectedDate);
-    const nextDay = STUDY_PLAN[currentIdx + 1];
-    if (!nextDay) return;
-    const result = await delayTask(selectedDate, index, nextDay.date);
-    if (result) setTaskStates(prev => ({ ...prev, [index]: result }));
-  };
-
-  const handleSaveLog = async () => {
-    setSaving(true);
-    await upsertDailyLog(selectedDate, { hours_studied: parseFloat(hoursInput)||0, anki_cards: parseInt(ankiInput)||0, notes: noteInput });
-    setSaving(false);
-  };
-
-  const handlePomodoroComplete = useCallback(() => {
-    setPomodoroCount(c => c + 1);
-    setTotalPomodoros(c => c + 1);
-  }, []);
-
-  const completedTasks = Object.values(taskStates).filter(t => t.completed).length;
-  const totalTasks = dayData?.tasks?.length || 0;
-  const completionPct = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
-  const totalHoursLogged = allLogs.reduce((sum, l) => sum + (l.hours_studied||0), 0);
-  const totalAnkiLogged = allLogs.reduce((sum, l) => sum + (l.anki_cards||0), 0);
-  const studyDays = allLogs.filter(l => l.hours_studied > 0).length;
-
-  const calYear = parseInt(calMonth.split('-')[0]);
-  const calMonthNum = parseInt(calMonth.split('-')[1]) - 1;
-  const firstDay = new Date(calYear, calMonthNum, 1).getDay();
-  const daysInMonth = new Date(calYear, calMonthNum + 1, 0).getDate();
-
+    if (!running) return;
+    ref.current = setInterval(() => {
+      setSecs(p => {
+        if (p <= 1) {
+          clearInterval(ref.current); chime();
+          if (!isBreak) { setDone(d=>d+1); if(onComplete)onComplete(); setIsBreak(true); setSecs(brk*60); setRunning(false); }
+          else { setIsBreak(false); setSecs(work*60); setRunning(false); }
+          return 0;
+        }
+        return p-1;
+      });
+    }, 1000);
+    return () => clearInterval(ref.current);
+  }, [running, isBreak, work, brk, chime, onComplete]);
+  const color = isBreak ? '#10B981' : '#F97316';
   return (
-    <div style={{ minHeight: '100vh', background: '#F7F2EB', fontFamily: "'Spectral', Georgia, serif", color: '#3D2B1F' }}>
-      <header style={{ background: '#FDFAF6', borderBottom: '1px solid #E8DDD0', padding: '0 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', height: '56px', position: 'sticky', top: 0, zIndex: 100 }}>
-        <div style={{ display: 'flex', alignItems: 'baseline', gap: '10px' }}>
-          <span style={{ fontSize: '17px', fontWeight: '400', letterSpacing: '-0.01em' }}>Step 2</span>
-          <span style={{ fontSize: '11px', color: '#8B6B4A', fontFamily: 'monospace', letterSpacing: '0.05em' }}>{daysToGo} days</span>
+    <div style={{background:'#fff',border:'1px solid #E5E7EB',borderRadius:16,padding:'20px 16px',textAlign:'center'}}>
+      <div style={{fontSize:11,fontWeight:700,letterSpacing:'0.08em',color,textTransform:'uppercase',marginBottom:12}}>{isBreak?'— break —':'— focus —'}</div>
+      <div style={{position:'relative',width:100,height:100,margin:'0 auto 16px'}}>
+        <svg viewBox="0 0 100 100" style={{width:100,height:100,transform:'rotate(-90deg)'}}>
+          <circle cx="50" cy="50" r="42" fill="none" stroke="#F3F4F6" strokeWidth="6"/>
+          <circle cx="50" cy="50" r="42" fill="none" stroke={color} strokeWidth="6" strokeLinecap="round" strokeDasharray={circ} strokeDashoffset={circ*(1-pct/100)} style={{transition:'stroke-dashoffset 1s linear,stroke .5s'}}/>
+        </svg>
+        <div style={{position:'absolute',inset:0,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center'}}>
+          <span style={{fontSize:22,fontWeight:700,letterSpacing:'-0.03em',color:'#111827',fontVariantNumeric:'tabular-nums'}}>{String(m).padStart(2,'0')}:{String(s).padStart(2,'0')}</span>
+          {done>0&&<span style={{fontSize:10,color:'#9CA3AF'}}>{done} done</span>}
         </div>
-        <nav style={{ display: 'flex', gap: '2px' }}>
-          {[['today','Today'],['calendar','Calendar'],['nbme','Scores'],['stats','Progress']].map(([id, label]) => (
-            <button key={id} onClick={() => setView(id)} style={{ background: view===id ? '#3D2B1F' : 'transparent', color: view===id ? '#F7F2EB' : '#8B6B4A', border: 'none', borderRadius: '6px', padding: '6px 14px', fontSize: '13px', cursor: 'pointer', fontFamily: 'monospace', transition: 'all 0.15s' }}>{label}</button>
+      </div>
+      <div style={{display:'flex',gap:8,justifyContent:'center',marginBottom:8}}>
+        <button onClick={()=>{clearInterval(ref.current);setRunning(false);setIsBreak(false);setSecs(work*60);}} style={btnSm('#F3F4F6','#374151')}>↺</button>
+        <button onClick={()=>setRunning(r=>!r)} style={{...btnSm(color,'#fff'),padding:'7px 20px',fontWeight:700}}>{running?'Pause':secs<total?'Resume':isBreak?'Start break':'Start'}</button>
+        <button onClick={()=>setShowSet(s=>!s)} style={btnSm('#F3F4F6','#9CA3AF')}>⚙</button>
+      </div>
+      {showSet&&(
+        <div style={{background:'#F9FAFB',borderRadius:10,padding:'10px 12px',marginTop:8}}>
+          {[['Work',work,setWork,'#F97316',5,120],['Break',brk,setBrk,'#10B981',1,30]].map(([lbl,val,set,c,mn,mx])=>(
+            <div key={lbl} style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:6}}>
+              <span style={{fontSize:12,color:'#6B7280',fontWeight:500}}>{lbl}</span>
+              <div style={{display:'flex',alignItems:'center',gap:4}}>
+                {[-5,-1].map(d=><button key={d} onClick={()=>{const v=Math.max(mn,val+d);set(v);if(!running&&(lbl==='Work'?!isBreak:isBreak))setSecs(v*60);}} style={btnTiny()}>{d}</button>)}
+                <span style={{fontSize:13,fontWeight:700,color:c,minWidth:32,textAlign:'center'}}>{val}m</span>
+                {[1,5].map(d=><button key={d} onClick={()=>{const v=Math.min(mx,val+d);set(v);if(!running&&(lbl==='Work'?!isBreak:isBreak))setSecs(v*60);}} style={btnTiny()}>+{d}</button>)}
+              </div>
+            </div>
           ))}
-        </nav>
-        <div style={{ display: 'flex', gap: '6px' }}>
-          {QUICK_LINKS.map(link => (
-            <a key={link.name} href={link.url} target="_blank" rel="noopener noreferrer" title={link.name} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: '32px', height: '32px', borderRadius: '8px', border: '1px solid #E8DDD0', fontSize: '14px', textDecoration: 'none', background: '#FDFAF6', color: '#3D2B1F' }}>{link.icon}</a>
-          ))}
-        </div>
-      </header>
-
-      {view === 'today' && (
-        <div style={{ maxWidth: '1100px', margin: '0 auto', padding: '24px', display: 'grid', gridTemplateColumns: '1fr 340px', gap: '20px' }}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-            <div style={{ background: phase.bg, borderRadius: '16px', padding: '20px 24px', border: `1px solid ${phase.dot}50` }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-                <div>
-                  <div style={{ fontSize: '12px', fontFamily: 'monospace', color: phase.accent, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: '4px' }}>
-                    {new Date(selectedDate+'T12:00:00').toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric'})}
-                  </div>
-                  <div style={{ fontSize: '22px', fontWeight: '400', letterSpacing: '-0.01em', lineHeight: 1.2 }}>{dayData?.label || 'Study day'}</div>
-                  {dayData && (
-                    <div style={{ marginTop: '6px', display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                      {[
-                        [`Phase ${dayData.phase}: ${phase.label}`, phase.accent, phase.dot+'30'],
-                        [`${dayData.hrs_target}h target`, '#8B6B4A', '#E8DDD0'],
-                        ...(dayData.is_lce ? [['LCE day', '#3D7A4A', '#82C4A030']] : []),
-                        ...(dayData.special==='exam' ? [['Exam day', '#C4703A', '#E8A87830']] : []),
-                      ].map(([text, color, bg]) => (
-                        <span key={text} style={{ fontSize: '11px', padding: '2px 8px', borderRadius: '20px', background: bg, color, fontFamily: 'monospace', fontWeight: '500' }}>{text}</span>
-                      ))}
-                    </div>
-                  )}
-                </div>
-                <div style={{ textAlign: 'center' }}>
-                  <ProgressRing pct={completionPct} color={phase.accent} size={60} />
-                  <div style={{ fontSize: '10px', color: '#8B6B4A', marginTop: '4px', fontFamily: 'monospace' }}>{completedTasks}/{totalTasks} tasks</div>
-                </div>
-              </div>
-            </div>
-
-            <div style={{ borderLeft: '3px solid #C4703A', paddingLeft: '16px', background: '#FDFAF6', borderRadius: '0 10px 10px 0', padding: '14px 14px 14px 18px', border: '1px solid #E8DDD0', borderLeftWidth: '3px', borderLeftColor: '#C4703A', borderLeftStyle: 'solid' }}>
-              <p style={{ fontSize: '14px', fontStyle: 'italic', color: '#5A3D2B', lineHeight: 1.7, margin: 0 }}>"{quote.text}"</p>
-              <p style={{ fontSize: '11px', color: '#8B6B4A', marginTop: '8px', marginBottom: 0, fontFamily: 'monospace' }}>— {quote.source}</p>
-            </div>
-
-            {dayData?.tasks && (
-              <div style={{ background: '#FDFAF6', borderRadius: '14px', border: '1px solid #E8DDD0', overflow: 'hidden' }}>
-                <div style={{ padding: '14px 18px 10px', borderBottom: '1px solid #F0E8DE', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <span style={{ fontSize: '12px', fontWeight: '600', letterSpacing: '0.08em', textTransform: 'uppercase', color: '#8B6B4A', fontFamily: 'monospace' }}>Today's tasks</span>
-                  <span style={{ fontSize: '11px', color: '#B0A090' }}>Day {dayData.day} of 73</span>
-                </div>
-                {dayData.tasks.map((task, i) => {
-                  const state = taskStates[i];
-                  const isCompleted = state?.completed;
-                  const isDelayed = state?.delayed_to;
-                  return (
-                    <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '11px 18px', borderBottom: i < dayData.tasks.length-1 ? '1px solid #F5EFE8' : 'none', background: isCompleted ? '#F5FBF5' : isDelayed ? '#FBF5F0' : 'transparent' }}>
-                      <button onClick={() => handleTaskToggle(i, !isCompleted)} style={{ width: '20px', height: '20px', borderRadius: '6px', border: `2px solid ${isCompleted ? '#4A7A5A' : '#C4B8A8'}`, background: isCompleted ? '#4A7A5A' : 'transparent', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, transition: 'all 0.15s' }}>
-                        {isCompleted && <span style={{ color: '#FFF', fontSize: '11px', fontWeight: '700' }}>✓</span>}
-                      </button>
-                      <span style={{ fontSize: '14px', color: isCompleted ? '#8B9B8B' : isDelayed ? '#B0A090' : '#3D2B1F', textDecoration: isCompleted ? 'line-through' : 'none', flex: 1, lineHeight: 1.5 }}>
-                        {task}{isDelayed && <span style={{ fontSize: '11px', color: '#C4703A', marginLeft: '8px' }}>→ delayed to {state.delayed_to}</span>}
-                      </span>
-                      {!isCompleted && !isDelayed && (
-                        <button onClick={() => handleDelayTask(i)} style={{ background: 'none', border: '1px solid #E8DDD0', borderRadius: '6px', padding: '3px 8px', fontSize: '10px', color: '#B0A090', cursor: 'pointer', fontFamily: 'monospace' }}>→tmrw</button>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-            <div style={{ background: '#FDFAF6', borderRadius: '14px', border: '1px solid #E8DDD0', padding: '16px 18px' }}>
-              <div style={{ fontSize: '12px', fontWeight: '600', letterSpacing: '0.08em', textTransform: 'uppercase', color: '#8B6B4A', fontFamily: 'monospace', marginBottom: '12px' }}>Log today</div>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', marginBottom: '10px' }}>
-                {[['Hours studied','number',hoursInput,setHoursInput,'e.g. 5.5'],['Anki cards','number',ankiInput,setAnkiInput,'e.g. 50']].map(([label,type,value,setter,placeholder]) => (
-                  <div key={label}>
-                    <label style={{ fontSize: '10px', color: '#8B6B4A', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.06em', display: 'block', marginBottom: '5px', fontFamily: 'monospace' }}>{label}</label>
-                    <input type={type} value={value} onChange={e => setter(e.target.value)} placeholder={placeholder} style={{ width: '100%', padding: '8px 10px', borderRadius: '8px', border: '1px solid #E8DDD0', fontSize: '13px', background: '#FDFAF6', fontFamily: 'monospace', color: '#3D2B1F', outline: 'none' }} />
-                  </div>
-                ))}
-              </div>
-              <textarea value={noteInput} onChange={e => setNoteInput(e.target.value)} placeholder="What clicked today? What needs more work?" rows={2} style={{ width: '100%', padding: '8px 10px', borderRadius: '8px', border: '1px solid #E8DDD0', fontSize: '13px', fontFamily: "'Spectral', Georgia, serif", color: '#3D2B1F', background: '#FDFAF6', resize: 'vertical', outline: 'none', marginBottom: '10px', boxSizing: 'border-box' }} />
-              <button onClick={handleSaveLog} disabled={saving} style={{ background: '#3D2B1F', color: '#F7F2EB', border: 'none', borderRadius: '8px', padding: '9px 20px', fontSize: '13px', cursor: 'pointer', fontFamily: 'monospace', opacity: saving ? 0.6 : 1 }}>{saving ? 'Saving...' : 'Save log'}</button>
-            </div>
-          </div>
-
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-            <div style={{ background: '#FDFAF6', borderRadius: '16px', border: '1px solid #E8DDD0', padding: '16px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px' }}>
-              <div style={{ fontSize: '10px', fontFamily: 'monospace', color: '#8B6B4A', letterSpacing: '0.08em', textTransform: 'uppercase' }}>Koidu Government Hospital</div>
-              <div style={{ width: '140px', height: '140px' }}><StaghornFern pomodoroCount={totalPomodoros} /></div>
-              <div style={{ fontSize: '11px', color: '#B0A090', textAlign: 'center', lineHeight: 1.5 }}>
-                {totalPomodoros === 0 ? 'Complete a session to grow your fern' : totalPomodoros < 3 ? 'A seedling takes root' : totalPomodoros < 7 ? 'The fronds are opening' : totalPomodoros < 15 ? 'Growing steadily' : totalPomodoros < 26 ? 'A full, healthy fern' : 'The staghorn thrives'}
-              </div>
-            </div>
-
-            <PomodoroTimer currentDate={selectedDate} currentSystem={dayData?.system || ''} onPomodoroComplete={handlePomodoroComplete} />
-
-            <div style={{ background: '#FDFAF6', borderRadius: '14px', border: '1px solid #E8DDD0', padding: '14px 16px' }}>
-              <div style={{ fontSize: '10px', fontFamily: 'monospace', color: '#8B6B4A', letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: '10px' }}>Running totals</div>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
-                {[['Hours', totalHoursLogged.toFixed(1)],['Anki', totalAnkiLogged.toLocaleString()],['Pomodoros', totalPomodoros],['Study days', studyDays]].map(([label, value]) => (
-                  <div key={label} style={{ background: '#F5EFE8', borderRadius: '8px', padding: '8px 10px' }}>
-                    <div style={{ fontSize: '9px', color: '#8B6B4A', fontFamily: 'monospace', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{label}</div>
-                    <div style={{ fontSize: '18px', fontWeight: '400', fontFamily: 'monospace', color: '#3D2B1F' }}>{value}</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            <div style={{ background: '#FDFAF6', borderRadius: '14px', border: '1px solid #E8DDD0', padding: '12px 16px' }}>
-              <div style={{ fontSize: '10px', fontFamily: 'monospace', color: '#8B6B4A', letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: '10px' }}>Jump to</div>
-              <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
-                <button onClick={() => setSelectedDate(TODAY)} style={{ background: selectedDate===TODAY ? '#3D2B1F' : '#F5EFE8', color: selectedDate===TODAY ? '#F7F2EB' : '#8B6B4A', border: 'none', borderRadius: '6px', padding: '5px 10px', fontSize: '11px', cursor: 'pointer', fontFamily: 'monospace' }}>Today</button>
-                {STUDY_PLAN.filter(d => d.special==='exam').slice(0,4).map(d => (
-                  <button key={d.date} onClick={() => setSelectedDate(d.date)} style={{ background: selectedDate===d.date ? '#3D2B1F' : '#F5EFE8', color: selectedDate===d.date ? '#F7F2EB' : '#8B6B4A', border: 'none', borderRadius: '6px', padding: '5px 10px', fontSize: '11px', cursor: 'pointer', fontFamily: 'monospace' }}>{d.label.split('—')[0].trim().replace('NBME ','N')}</button>
-                ))}
-              </div>
-            </div>
-          </div>
         </div>
       )}
-
-      {view === 'calendar' && (
-        <div style={{ maxWidth: '900px', margin: '0 auto', padding: '24px' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
-            <button onClick={() => { const d = new Date(calYear, calMonthNum-1, 1); setCalMonth(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`); }} style={{ background: '#F5EFE8', border: '1px solid #E8DDD0', borderRadius: '8px', padding: '8px 16px', fontSize: '16px', cursor: 'pointer', color: '#3D2B1F' }}>←</button>
-            <div style={{ fontSize: '18px', fontWeight: '400' }}>{new Date(calYear, calMonthNum, 1).toLocaleDateString('en-US',{month:'long',year:'numeric'})}</div>
-            <button onClick={() => { const d = new Date(calYear, calMonthNum+1, 1); setCalMonth(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`); }} style={{ background: '#F5EFE8', border: '1px solid #E8DDD0', borderRadius: '8px', padding: '8px 16px', fontSize: '16px', cursor: 'pointer', color: '#3D2B1F' }}>→</button>
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7,1fr)', gap: '3px', marginBottom: '3px' }}>
-            {['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(d => <div key={d} style={{ fontSize: '11px', color: '#B0A090', textAlign: 'center', padding: '4px 0', fontFamily: 'monospace' }}>{d}</div>)}
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7,1fr)', gap: '3px' }}>
-            {Array.from({length: firstDay}).map((_,i) => <div key={`e${i}`} />)}
-            {Array.from({length: daysInMonth}).map((_,i) => {
-              const day = i+1;
-              const dateStr = `${calYear}-${String(calMonthNum+1).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
-              const d = getDayData(dateStr);
-              const ps = d ? PHASE_STYLES[d.phase] : null;
-              const isToday = dateStr === TODAY;
-              const isSelected = dateStr === selectedDate;
-              const isExam = d?.special==='exam' || d?.special==='exam_opt';
-              return (
-                <div key={day} onClick={() => { if(d){setSelectedDate(dateStr); setView('today');} }} style={{ minHeight: '70px', borderRadius: '10px', padding: '6px 7px', cursor: d ? 'pointer' : 'default', background: isSelected ? '#3D2B1F' : ps ? ps.bg : '#F7F2EB', border: isToday ? '2px solid #C4703A' : isExam ? `2px solid ${ps?.accent}` : '1px solid transparent', opacity: d ? 1 : 0.3 }}>
-                  <div style={{ fontSize: '11px', fontWeight: isToday ? '700' : '400', color: isSelected ? '#F7F2EB' : '#3D2B1F', fontFamily: 'monospace', marginBottom: '3px' }}>{day}</div>
-                  {d && <>
-                    <div style={{ fontSize: '10px', color: isSelected ? '#C4A882' : ps.accent, lineHeight: 1.3, marginBottom: '3px' }}>{d.system?.substring(0,12)}</div>
-                    <div style={{ display: 'flex', gap: '3px', flexWrap: 'wrap' }}>
-                      {isExam && <span style={{ fontSize: '8px', background: '#C4703A', color: '#FFF', borderRadius: '4px', padding: '1px 4px', fontFamily: 'monospace' }}>EXAM</span>}
-                      {d.is_lce && <span style={{ fontSize: '8px', background: '#3D7A4A', color: '#FFF', borderRadius: '4px', padding: '1px 4px' }}>LCE</span>}
-                    </div>
-                  </>}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
-
-      {view === 'nbme' && (
-        <div style={{ maxWidth: '600px', margin: '0 auto', padding: '24px' }}>
-          <h2 style={{ fontSize: '20px', fontWeight: '400', marginBottom: '20px', letterSpacing: '-0.01em' }}>Score tracker</h2>
-          <NBMETracker />
-        </div>
-      )}
-
-      {view === 'stats' && (
-        <div style={{ maxWidth: '800px', margin: '0 auto', padding: '24px', display: 'flex', flexDirection: 'column', gap: '20px' }}>
-          <h2 style={{ fontSize: '20px', fontWeight: '400', letterSpacing: '-0.01em' }}>Progress</h2>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: '10px' }}>
-            {[['Hours logged', totalHoursLogged.toFixed(1), 'of ~362 projected'],['Anki cards', totalAnkiLogged.toLocaleString(), 'total reviewed'],['Pomodoros', totalPomodoros, '50-min sessions'],['Days to exam', daysToGo, 'Jun 12, 2026']].map(([label,value,sub]) => (
-              <div key={label} style={{ background: '#FDFAF6', borderRadius: '12px', padding: '14px 16px', border: '1px solid #E8DDD0' }}>
-                <div style={{ fontSize: '11px', color: '#8B6B4A', fontFamily: 'monospace', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '4px' }}>{label}</div>
-                <div style={{ fontSize: '24px', fontWeight: '400', letterSpacing: '-0.02em', fontFamily: 'monospace' }}>{value}</div>
-                <div style={{ fontSize: '11px', color: '#B0A090', marginTop: '2px' }}>{sub}</div>
-              </div>
-            ))}
-          </div>
-          <div style={{ background: '#FDFAF6', borderRadius: '14px', border: '1px solid #E8DDD0', padding: '16px 20px' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
-              <span style={{ fontSize: '12px', fontFamily: 'monospace', color: '#8B6B4A', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Hours toward 362</span>
-              <span style={{ fontSize: '12px', fontFamily: 'monospace', color: '#3D2B1F' }}>{((totalHoursLogged/362)*100).toFixed(1)}%</span>
-            </div>
-            <div style={{ height: '8px', background: '#E8DDD0', borderRadius: '4px', overflow: 'hidden' }}>
-              <div style={{ height: '100%', width: `${Math.min((totalHoursLogged/362)*100,100)}%`, background: '#C4703A', borderRadius: '4px', transition: 'width 0.5s ease' }} />
-            </div>
-          </div>
-          {allLogs.length > 0 && (
-            <div style={{ background: '#FDFAF6', borderRadius: '14px', border: '1px solid #E8DDD0', padding: '16px 20px' }}>
-              <div style={{ fontSize: '12px', fontFamily: 'monospace', color: '#8B6B4A', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '12px' }}>Daily hours</div>
-              <div style={{ display: 'flex', alignItems: 'flex-end', gap: '3px', height: '80px' }}>
-                {allLogs.slice(-30).map(log => {
-                  const h = log.hours_studied || 0;
-                  const pct = Math.min((h/10)*100,100);
-                  const d = getDayData(log.date);
-                  const ps = d ? PHASE_STYLES[d.phase] : PHASE_STYLES[1];
-                  return <div key={log.date} title={`${log.date}: ${h}h`} style={{ flex:1, display:'flex', flexDirection:'column', justifyContent:'flex-end', minWidth:'6px' }}><div style={{ height:`${pct}%`, background:ps.accent, borderRadius:'2px 2px 0 0', opacity:0.8, minHeight: h>0?'3px':'0' }}/></div>;
-                })}
-              </div>
-            </div>
-          )}
-          <div style={{ background: '#FDFAF6', borderRadius: '14px', border: '1px solid #E8DDD0', padding: '20px', display: 'flex', alignItems: 'center', gap: '24px' }}>
-            <div style={{ width: '100px', height: '100px', flexShrink: 0 }}><StaghornFern pomodoroCount={totalPomodoros} /></div>
-            <div>
-              <div style={{ fontSize: '14px', marginBottom: '6px', fontStyle: 'italic' }}>The staghorn fern at Koidu Government Hospital</div>
-              <div style={{ fontSize: '12px', color: '#8B6B4A', lineHeight: 1.6 }}>
-                {totalPomodoros} focus sessions · {totalPomodoros * 50} minutes of deep work · {totalPomodoros >= 26 ? 'The fern is fully grown.' : `${26-totalPomodoros} sessions until full growth.`}
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-      <style>{`@import url('https://fonts.googleapis.com/css2?family=Spectral:ital,wght@0,300;0,400;0,500;1,300;1,400&family=DM+Mono:wght@300;400;500&display=swap'); *{box-sizing:border-box;} button:hover{opacity:0.85;} a:hover{opacity:0.8;}`}</style>
     </div>
   );
 }
 
-function ProgressRing({ pct, color, size=60 }) {
-  const r = size * 0.4;
-  const circ = 2 * Math.PI * r;
-  const offset = circ * (1 - pct/100);
+const btnSm = (bg,color) => ({background:bg,color,border:'none',borderRadius:8,padding:'7px 12px',fontSize:13,cursor:'pointer',fontFamily:'inherit',fontWeight:500});
+const btnTiny = () => ({background:'#E5E7EB',color:'#374151',border:'none',borderRadius:5,padding:'2px 6px',fontSize:11,cursor:'pointer',fontFamily:'monospace'});
+
+function NBMETracker() {
+  const [scores, setScores] = useState([]);
+  const [showAdd, setShowAdd] = useState(false);
+  const [form, setForm] = useState({exam_name:'NBME 9',date_taken:'',score:'',percentile:'',notes:''});
+  useEffect(()=>{getNBMEScores().then(setScores);},[]);
+  const handleAdd = async e => {
+    e.preventDefault();
+    const r = await addNBMEScore(form.exam_name,form.date_taken,parseInt(form.score)||null,parseInt(form.percentile)||null,form.notes);
+    if(r){setScores(p=>[...p,r].sort((a,b)=>new Date(a.date_taken)-new Date(b.date_taken)));setShowAdd(false);setForm({exam_name:'NBME 9',date_taken:'',score:'',percentile:'',notes:''});}
+  };
+  const cs=scores.filter(s=>s.score);
+  const TARGET=270,W=320,H=140,pL=40,pR=20,pT=15,pB=25,iW=W-pL-pR,iH=H-pT-pB;
+  const maxS=Math.max(...cs.map(s=>s.score),TARGET,272),minS=Math.max(200,Math.min(...cs.map(s=>s.score),235)-10);
+  const toX=i=>pL+(i/Math.max(cs.length-1,1))*iW;
+  const toY=v=>pT+iH-((v-minS)/(maxS-minS))*iH;
+  const ty=toY(TARGET);
+  const inp={width:'100%',padding:'7px 10px',borderRadius:8,border:'1px solid #E5E7EB',fontSize:13,background:'#fff',fontFamily:'inherit',color:'#111827',outline:'none',boxSizing:'border-box'};
+  const lbl={fontSize:11,color:'#6B7280',fontWeight:600,textTransform:'uppercase',letterSpacing:'0.06em',display:'block',marginBottom:4};
   return (
-    <svg viewBox={`0 0 ${size} ${size}`} style={{ width:size, height:size, transform:'rotate(-90deg)' }}>
-      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="#E8DDD0" strokeWidth="4"/>
-      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={color} strokeWidth="4" strokeLinecap="round" strokeDasharray={circ} strokeDashoffset={offset} style={{ transition:'stroke-dashoffset 0.5s ease' }}/>
-      <text x={size/2} y={size/2} textAnchor="middle" dominantBaseline="central" style={{ transform:`rotate(90deg)`, transformOrigin:`${size/2}px ${size/2}px` }} fontSize={size*0.22} fontWeight="500" fill={color} fontFamily="monospace">{pct}%</text>
-    </svg>
+    <div style={{display:'flex',flexDirection:'column',gap:14}}>
+      {cs.length>0?(
+        <div style={{background:'#fff',borderRadius:12,padding:16,border:'1px solid #E5E7EB'}}>
+          <div style={{fontSize:11,fontWeight:700,color:'#9CA3AF',textTransform:'uppercase',letterSpacing:'0.06em',marginBottom:10}}>Score trajectory — target 270</div>
+          <svg viewBox={`0 0 ${W} ${H}`} style={{width:'100%',height:'auto'}}>
+            {[0,.25,.5,.75,1].map(t=>{const v=Math.round(minS+t*(maxS-minS)),y=toY(v);return <g key={t}><line x1={pL} y1={y} x2={W-pR} y2={y} stroke="#F3F4F6" strokeWidth="1"/><text x={pL-4} y={y+4} textAnchor="end" fontSize="9" fill="#9CA3AF">{v}</text></g>;})}
+            <line x1={pL} y1={ty} x2={W-pR} y2={ty} stroke="#F97316" strokeWidth="1.5" strokeDasharray="4 3" opacity=".7"/>
+            <text x={W-pR+3} y={ty+4} fontSize="9" fill="#F97316" fontWeight="600">270</text>
+            {cs.length>1&&<polyline points={cs.map((s,i)=>`${toX(i)},${toY(s.score)}`).join(' ')} fill="none" stroke="#6B7280" strokeWidth="2" strokeLinejoin="round"/>}
+            {cs.map((s,i)=>(<g key={s.id}><circle cx={toX(i)} cy={toY(s.score)} r="5" fill={s.score>=TARGET?'#10B981':'#F97316'}/><text x={toX(i)} y={toY(s.score)-9} textAnchor="middle" fontSize="9" fill="#111827" fontWeight="600">{s.score}</text><text x={toX(i)} y={H-5} textAnchor="middle" fontSize="8" fill="#9CA3AF">{s.exam_name.replace('NBME ','N')}</text></g>))}
+          </svg>
+          <div style={{display:'flex',gap:8,marginTop:8,flexWrap:'wrap'}}>
+            <Chip label="Latest" value={cs[cs.length-1].score} color="#111827"/>
+            <Chip label="To target" value={`${TARGET-cs[cs.length-1].score>0?'+':''}${TARGET-cs[cs.length-1].score} pts`} color={cs[cs.length-1].score>=TARGET?'#10B981':'#F97316'}/>
+            {cs.length>1&&<Chip label="Trend" value={`${cs[cs.length-1].score-cs[0].score>0?'+':''}${cs[cs.length-1].score-cs[0].score} since start`} color="#6B7280"/>}
+          </div>
+        </div>
+      ):(
+        <div style={{background:'#F9FAFB',borderRadius:12,padding:24,textAlign:'center',border:'1px solid #E5E7EB'}}>
+          <div style={{fontSize:13,color:'#9CA3AF'}}>No scores yet — NBME 9 baseline on Apr 4</div>
+        </div>
+      )}
+      {scores.length>0&&(<div style={{display:'flex',flexDirection:'column',gap:6}}>{scores.map(s=>(<div key={s.id} style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'9px 14px',background:'#fff',borderRadius:10,border:'1px solid #E5E7EB'}}><div><span style={{fontSize:14,fontWeight:600,color:'#111827'}}>{s.exam_name}</span><span style={{fontSize:12,color:'#9CA3AF',marginLeft:8}}>{fmtShort(s.date_taken)}</span></div><div style={{display:'flex',alignItems:'center',gap:8}}>{s.score&&<span style={{fontSize:18,fontWeight:700,color:s.score>=270?'#10B981':'#F97316',fontVariantNumeric:'tabular-nums'}}>{s.score}</span>}{s.percentile&&<span style={{fontSize:11,color:'#9CA3AF'}}>{s.percentile}th</span>}</div></div>))}</div>)}
+      {showAdd?(
+        <form onSubmit={handleAdd} style={{background:'#F9FAFB',borderRadius:12,padding:16,display:'flex',flexDirection:'column',gap:10,border:'1px solid #E5E7EB'}}>
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
+            <div><label style={lbl}>Exam</label><select value={form.exam_name} onChange={e=>setForm(f=>({...f,exam_name:e.target.value}))} style={inp}>{NBME_NAMES.map(n=><option key={n}>{n}</option>)}</select></div>
+            <div><label style={lbl}>Date</label><input type="date" value={form.date_taken} onChange={e=>setForm(f=>({...f,date_taken:e.target.value}))} style={inp} required/></div>
+            <div><label style={lbl}>Score</label><input type="number" min="200" max="300" placeholder="e.g. 248" value={form.score} onChange={e=>setForm(f=>({...f,score:e.target.value}))} style={inp}/></div>
+            <div><label style={lbl}>Percentile</label><input type="number" min="1" max="99" placeholder="e.g. 62" value={form.percentile} onChange={e=>setForm(f=>({...f,percentile:e.target.value}))} style={inp}/></div>
+          </div>
+          <div><label style={lbl}>Notes</label><input type="text" placeholder="Weak areas..." value={form.notes} onChange={e=>setForm(f=>({...f,notes:e.target.value}))} style={inp}/></div>
+          <div style={{display:'flex',gap:8}}><button type="submit" style={{flex:1,...btnSm('#F97316','#fff')}}>Log score</button><button type="button" onClick={()=>setShowAdd(false)} style={btnSm('#F3F4F6','#374151')}>Cancel</button></div>
+        </form>
+      ):(
+        <button onClick={()=>setShowAdd(true)} style={{background:'#fff',color:'#F97316',border:'1.5px dashed #FED7AA',borderRadius:10,padding:'10px',fontSize:13,fontWeight:600,cursor:'pointer',fontFamily:'inherit'}}>+ Log NBME / UWSA score</button>
+      )}
+    </div>
+  );
+}
+
+const Chip = ({label,value,color}) => (<div style={{background:'#F9FAFB',borderRadius:8,padding:'4px 10px',border:'1px solid #E5E7EB'}}><div style={{fontSize:9,color:'#9CA3AF',textTransform:'uppercase',letterSpacing:'0.06em'}}>{label}</div><div style={{fontSize:13,fontWeight:700,color,fontVariantNumeric:'tabular-nums'}}>{value}</div></div>);
+const Tag = ({bg,color,children}) => (<span style={{fontSize:11,fontWeight:600,padding:'3px 9px',borderRadius:20,background:bg,color}}>{children}</span>);
+
+export default function App() {
+  const [view, setView] = useState('today');
+  const [selDate, setSelDate] = useState(TODAY);
+  const [calMonth, setCalMonth] = useState(()=>TODAY.substring(0,7));
+  const [taskStates, setTaskStates] = useState({});
+  const [customTasks, setCustomTasks] = useState([]);
+  const [newTaskInput, setNewTaskInput] = useState('');
+  const [totalPoms, setTotalPoms] = useState(0);
+  const [hoursIn, setHoursIn] = useState('');
+  const [ankiIn, setAnkiIn] = useState('');
+  const [noteIn, setNoteIn] = useState('');
+  const [allLogs, setAllLogs] = useState([]);
+  const [saving, setSaving] = useState(false);
+  const [saveTick, setSaveTick] = useState(false);
+
+  const day = getDayData(selDate);
+  const ph = day ? PH[day.phase] : PH[1];
+  const quote = getQuoteForDate(selDate);
+  const dtg = daysToExam();
+
+  useEffect(() => {
+    Promise.all([getDailyLog(selDate),getTaskCompletions(selDate),getPomodorosForDate(selDate)]).then(([log,tasks,poms])=>{
+      setHoursIn(log?.hours_studied?.toString()||'');
+      setAnkiIn(log?.anki_cards?.toString()||'');
+      setNoteIn(log?.notes||'');
+      const m={}; tasks.forEach(t=>{m[t.task_index]=t;}); setTaskStates(m);
+    });
+  },[selDate]);
+
+  useEffect(()=>{
+    Promise.all([getAllDailyLogs(),getAllPomodoros()]).then(([logs,poms])=>{setAllLogs(logs);setTotalPoms(poms.length);});
+  },[]);
+
+  const toggleTask = async (i,completed) => { const r=await toggleTaskCompletion(selDate,i,completed); if(r)setTaskStates(p=>({...p,[i]:r})); };
+  const delayTaskFn = async i => { const idx=STUDY_PLAN.findIndex(d=>d.date===selDate); const next=STUDY_PLAN[idx+1]; if(!next)return; const r=await delayTask(selDate,i,next.date); if(r)setTaskStates(p=>({...p,[i]:r})); };
+  const saveLog = async () => { setSaving(true); await upsertDailyLog(selDate,{hours_studied:parseFloat(hoursIn)||0,anki_cards:parseInt(ankiIn)||0,notes:noteIn}); setSaving(false); setSaveTick(true); setTimeout(()=>setSaveTick(false),2000); const logs=await getAllDailyLogs(); setAllLogs(logs); };
+  const addCustomTask = () => { if(!newTaskInput.trim())return; setCustomTasks(p=>[...p,{text:newTaskInput.trim(),done:false}]); setNewTaskInput(''); };
+  const toggleCustomTask = i => setCustomTasks(p=>p.map((t,idx)=>idx===i?{...t,done:!t.done}:t));
+
+  const completedCount = Object.values(taskStates).filter(t=>t.completed).length + customTasks.filter(t=>t.done).length;
+  const totalCount = (day?.tasks?.length||0) + customTasks.length;
+  const pct = totalCount>0?Math.round((completedCount/totalCount)*100):0;
+  const totalHrs = allLogs.reduce((s,l)=>s+(l.hours_studied||0),0);
+  const totalAnki = allLogs.reduce((s,l)=>s+(l.anki_cards||0),0);
+  const studyDays = allLogs.filter(l=>l.hours_studied>0).length;
+  const calY=parseInt(calMonth.split('-')[0]),calM=parseInt(calMonth.split('-')[1])-1;
+  const firstDow=new Date(calY,calM,1).getDay(),daysInM=new Date(calY,calM+1,0).getDate();
+  const monthName=new Date(calY,calM,1).toLocaleDateString('en-US',{month:'long',year:'numeric'});
+
+  return (
+    <div style={{minHeight:'100vh',background:'#F9FAFB',fontFamily:"'Inter',-apple-system,BlinkMacSystemFont,sans-serif",color:'#111827'}}>
+      <header style={{background:'#fff',borderBottom:'1px solid #E5E7EB',height:52,display:'flex',alignItems:'center',justifyContent:'space-between',padding:'0 20px',position:'sticky',top:0,zIndex:100}}>
+        <div style={{display:'flex',alignItems:'center',gap:10}}>
+          <span style={{fontSize:16,fontWeight:700,letterSpacing:'-0.02em'}}>Step 2</span>
+          <span style={{fontSize:12,fontWeight:600,color:'#F97316',background:'#FFF7ED',padding:'3px 10px',borderRadius:20}}>{dtg}d</span>
+        </div>
+        <nav style={{display:'flex',gap:2}}>
+          {[['today','Today'],['calendar','Calendar'],['scores','Scores'],['progress','Progress']].map(([id,lbl])=>(
+            <button key={id} onClick={()=>setView(id)} style={{background:view===id?'#111827':'transparent',color:view===id?'#fff':'#6B7280',border:'none',borderRadius:8,padding:'6px 14px',fontSize:13,fontWeight:500,cursor:'pointer',transition:'all .15s'}}>{lbl}</button>
+          ))}
+        </nav>
+        <div style={{display:'flex',gap:5}}>
+          {QUICK_LINKS.map(l=>(
+            <a key={l.name} href={l.url} target="_blank" rel="noopener noreferrer" title={l.name}
+              style={{fontSize:11,fontWeight:700,color:'#6B7280',background:'#F3F4F6',borderRadius:7,padding:'4px 8px',textDecoration:'none'}}>
+              {l.short}
+            </a>
+          ))}
+        </div>
+      </header>
+
+      {view==='today'&&(
+        <div style={{maxWidth:1080,margin:'0 auto',padding:'20px',display:'grid',gridTemplateColumns:'1fr 320px',gap:16}}>
+          <div style={{display:'flex',flexDirection:'column',gap:14}}>
+            <div style={{background:'#fff',borderRadius:14,border:'1px solid #E5E7EB',padding:'18px 20px'}}>
+              <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:12}}>
+                <div style={{display:'flex',alignItems:'center',gap:8}}>
+                  <button onClick={()=>{const p=offsetDate(selDate,-1);if(getDayData(p))setSelDate(p);}} style={{...btnSm('#F3F4F6','#374151'),padding:'5px 11px',fontSize:16}}>←</button>
+                  <button onClick={()=>setSelDate(TODAY)} style={{...btnSm(selDate===TODAY?'#111827':'#F3F4F6',selDate===TODAY?'#fff':'#374151'),fontSize:12,fontWeight:600,padding:'5px 12px'}}>Today</button>
+                  <button onClick={()=>{const n=offsetDate(selDate,1);if(getDayData(n))setSelDate(n);}} style={{...btnSm('#F3F4F6','#374151'),padding:'5px 11px',fontSize:16}}>→</button>
+                </div>
+                <div style={{display:'flex',alignItems:'center',gap:10}}>
+                  <svg viewBox="0 0 44 44" style={{width:44,height:44,transform:'rotate(-90deg)'}}>
+                    <circle cx="22" cy="22" r="18" fill="none" stroke="#F3F4F6" strokeWidth="4"/>
+                    <circle cx="22" cy="22" r="18" fill="none" stroke={ph.accent} strokeWidth="4" strokeLinecap="round" strokeDasharray={2*Math.PI*18} strokeDashoffset={2*Math.PI*18*(1-pct/100)} style={{transition:'stroke-dashoffset .5s'}}/>
+                  </svg>
+                  <div><div style={{fontSize:16,fontWeight:700,color:ph.accent}}>{pct}%</div><div style={{fontSize:11,color:'#9CA3AF'}}>{completedCount}/{totalCount}</div></div>
+                </div>
+              </div>
+              <div style={{fontSize:12,fontWeight:500,color:'#9CA3AF',textTransform:'uppercase',letterSpacing:'0.06em',marginBottom:4}}>{fmtDate(selDate)}</div>
+              <div style={{fontSize:22,fontWeight:700,letterSpacing:'-0.02em',lineHeight:1.2,marginBottom:10}}>{day?.label||'Study day'}</div>
+              {day&&<div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+                <Tag bg={ph.tag} color={ph.tagText}>Phase {day.phase}: {ph.name}</Tag>
+                <Tag bg='#F3F4F6' color='#374151'>{day.hrs_target}h target</Tag>
+                {day.is_lce&&<Tag bg='#ECFDF5' color='#065F46'>LCE</Tag>}
+                {(day.special==='exam'||day.special==='exam_opt')&&<Tag bg='#FFF7ED' color='#C2410C'>{day.special==='exam_opt'?'Optional exam':'Exam day'}</Tag>}
+                {day.special==='flight'&&<Tag bg='#EFF6FF' color='#1D4ED8'>Flight ✈</Tag>}
+              </div>}
+            </div>
+
+            <div style={{background:'#fff',borderRadius:14,border:'1px solid #E5E7EB',borderLeft:'4px solid #F97316',padding:'14px 18px'}}>
+              <p style={{fontSize:14,fontStyle:'italic',color:'#374151',lineHeight:1.7,margin:0}}>"{quote.text}"</p>
+              <p style={{fontSize:11,color:'#9CA3AF',marginTop:8,marginBottom:0,fontWeight:500}}>— {quote.source}</p>
+            </div>
+
+            <div style={{background:'#fff',borderRadius:14,border:'1px solid #E5E7EB',overflow:'hidden'}}>
+              <div style={{padding:'13px 18px 10px',borderBottom:'1px solid #F3F4F6',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                <span style={{fontSize:12,fontWeight:700,color:'#374151',textTransform:'uppercase',letterSpacing:'0.06em'}}>Tasks</span>
+                <span style={{fontSize:11,color:'#9CA3AF'}}>Day {day?.day||'?'} of 73</span>
+              </div>
+              {day?.tasks?.map((task,i)=>{
+                const st=taskStates[i],done=st?.completed,delayed=st?.delayed_to;
+                return (
+                  <div key={i} style={{display:'flex',alignItems:'center',gap:12,padding:'11px 18px',borderBottom:'1px solid #F9FAFB',background:done?'#F9FAFB':'#fff'}}>
+                    <button onClick={()=>toggleTask(i,!done)} style={{width:20,height:20,borderRadius:6,border:`2px solid ${done?'#10B981':'#D1D5DB'}`,background:done?'#10B981':'transparent',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0,transition:'all .15s'}}>
+                      {done&&<span style={{color:'#fff',fontSize:11,fontWeight:700}}>✓</span>}
+                    </button>
+                    <span style={{fontSize:14,color:done?'#9CA3AF':'#111827',textDecoration:done?'line-through':'none',flex:1,lineHeight:1.5}}>
+                      {task}{delayed&&<span style={{fontSize:11,color:'#F97316',marginLeft:8,fontWeight:500}}>→ {delayed}</span>}
+                    </span>
+                    {!done&&!delayed&&<button onClick={()=>delayTaskFn(i)} style={{background:'none',border:'1px solid #E5E7EB',borderRadius:6,padding:'3px 8px',fontSize:10,color:'#9CA3AF',cursor:'pointer',fontFamily:'inherit'}}>delay →</button>}
+                  </div>
+                );
+              })}
+              {customTasks.map((t,i)=>(
+                <div key={`ct${i}`} style={{display:'flex',alignItems:'center',gap:12,padding:'11px 18px',borderBottom:'1px solid #F9FAFB',background:t.done?'#F9FAFB':'#fff'}}>
+                  <button onClick={()=>toggleCustomTask(i)} style={{width:20,height:20,borderRadius:6,border:`2px solid ${t.done?'#F97316':'#D1D5DB'}`,background:t.done?'#F97316':'transparent',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0,transition:'all .15s'}}>
+                    {t.done&&<span style={{color:'#fff',fontSize:11,fontWeight:700}}>✓</span>}
+                  </button>
+                  <span style={{fontSize:14,color:t.done?'#9CA3AF':'#111827',textDecoration:t.done?'line-through':'none',flex:1}}>{t.text}<span style={{fontSize:10,color:'#D1D5DB',marginLeft:6}}>custom</span></span>
+                  <button onClick={()=>setCustomTasks(p=>p.filter((_,idx)=>idx!==i))} style={{background:'none',border:'none',color:'#D1D5DB',cursor:'pointer',fontSize:16,padding:'0 4px'}}>×</button>
+                </div>
+              ))}
+              <div style={{padding:'10px 18px',display:'flex',gap:8,borderTop:'1px solid #F3F4F6'}}>
+                <input value={newTaskInput} onChange={e=>setNewTaskInput(e.target.value)} onKeyDown={e=>e.key==='Enter'&&addCustomTask()} placeholder="Add a task for today..."
+                  style={{flex:1,padding:'7px 12px',borderRadius:8,border:'1px solid #E5E7EB',fontSize:13,outline:'none',fontFamily:'inherit',color:'#111827'}}/>
+                <button onClick={addCustomTask} style={{...btnSm('#F97316','#fff'),fontWeight:700}}>Add</button>
+              </div>
+            </div>
+
+            <div style={{background:'#fff',borderRadius:14,border:'1px solid #E5E7EB',padding:'16px 18px'}}>
+              <div style={{fontSize:12,fontWeight:700,color:'#374151',textTransform:'uppercase',letterSpacing:'0.06em',marginBottom:12}}>Log today</div>
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
+                {[['Hours studied',hoursIn,setHoursIn,'e.g. 5.5','number'],['Anki cards',ankiIn,setAnkiIn,'e.g. 50','number']].map(([lbl,val,set,ph,type])=>(
+                  <div key={lbl}>
+                    <label style={{fontSize:11,color:'#9CA3AF',fontWeight:600,textTransform:'uppercase',letterSpacing:'0.06em',display:'block',marginBottom:5}}>{lbl}</label>
+                    <input type={type} value={val} onChange={e=>set(e.target.value)} placeholder={ph} style={{width:'100%',padding:'8px 10px',borderRadius:8,border:'1px solid #E5E7EB',fontSize:13,fontFamily:'inherit',color:'#111827',outline:'none',boxSizing:'border-box'}}/>
+                  </div>
+                ))}
+              </div>
+              <textarea value={noteIn} onChange={e=>setNoteIn(e.target.value)} placeholder="What clicked? What needs more work?" rows={2} style={{width:'100%',padding:'8px 10px',borderRadius:8,border:'1px solid #E5E7EB',fontSize:13,fontFamily:'inherit',color:'#111827',outline:'none',marginBottom:10,resize:'vertical',boxSizing:'border-box'}}/>
+              <button onClick={saveLog} disabled={saving} style={{...btnSm(saveTick?'#10B981':'#111827','#fff'),fontSize:13}}>{saveTick?'✓ Saved':saving?'Saving...':'Save log'}</button>
+            </div>
+          </div>
+
+          <div style={{display:'flex',flexDirection:'column',gap:14}}>
+            <div style={{background:'#fff',borderRadius:14,border:'1px solid #E5E7EB',padding:16,textAlign:'center'}}>
+              <div style={{fontSize:10,fontWeight:700,color:'#9CA3AF',textTransform:'uppercase',letterSpacing:'0.08em',marginBottom:8}}>Koidu Government Hospital</div>
+              <div style={{width:120,height:120,margin:'0 auto'}}><StaghornFern pomodoroCount={totalPoms}/></div>
+              <div style={{fontSize:11,color:'#9CA3AF',marginTop:8,lineHeight:1.5}}>{totalPoms===0?'Start a session to grow your fern':totalPoms<3?'A seedling takes root':totalPoms<7?'The fronds are opening':totalPoms<15?'Growing steadily':totalPoms<26?'A full, healthy fern':'The staghorn thrives'}</div>
+            </div>
+            <PomodoroTimer currentDate={selDate} currentSystem={day?.system||''} onComplete={()=>setTotalPoms(c=>c+1)}/>
+            <div style={{background:'#fff',borderRadius:14,border:'1px solid #E5E7EB',padding:'14px 16px'}}>
+              <div style={{fontSize:11,fontWeight:700,color:'#9CA3AF',textTransform:'uppercase',letterSpacing:'0.06em',marginBottom:10}}>Running totals</div>
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
+                {[['Hours',totalHrs.toFixed(1)],['Anki',totalAnki.toLocaleString()],['Pomodoros',totalPoms],['Study days',studyDays]].map(([lbl,val])=>(
+                  <div key={lbl} style={{background:'#F9FAFB',borderRadius:10,padding:'10px 12px',border:'1px solid #F3F4F6'}}>
+                    <div style={{fontSize:10,color:'#9CA3AF',fontWeight:600,textTransform:'uppercase',letterSpacing:'0.06em'}}>{lbl}</div>
+                    <div style={{fontSize:20,fontWeight:700,color:'#111827',fontVariantNumeric:'tabular-nums'}}>{val}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div style={{background:'#fff',borderRadius:14,border:'1px solid #E5E7EB',padding:'14px 16px'}}>
+              <div style={{fontSize:11,fontWeight:700,color:'#9CA3AF',textTransform:'uppercase',letterSpacing:'0.06em',marginBottom:10}}>Jump to</div>
+              <div style={{display:'flex',gap:5,flexWrap:'wrap'}}>
+                {EXAM_JUMPS.map(j=>{
+                  const target = j.label==='Today'?TODAY:j.date;
+                  return <button key={j.label} onClick={()=>setSelDate(target)} style={{background:selDate===target?'#111827':'#F3F4F6',color:selDate===target?'#fff':'#374151',border:'none',borderRadius:7,padding:'5px 9px',fontSize:11,fontWeight:600,cursor:'pointer',fontFamily:'inherit',whiteSpace:'nowrap'}}>{j.label}</button>;
+                })}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {view==='calendar'&&(
+        <div style={{maxWidth:900,margin:'0 auto',padding:'20px'}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+            <button onClick={()=>{const d=new Date(calY,calM-1,1);setCalMonth(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`);}} style={btnSm('#fff','#374151')}>← Prev</button>
+            <div style={{fontSize:18,fontWeight:700,letterSpacing:'-0.02em'}}>{monthName}</div>
+            <button onClick={()=>{const d=new Date(calY,calM+1,1);setCalMonth(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`);}} style={btnSm('#fff','#374151')}>Next →</button>
+          </div>
+          <div style={{display:'grid',gridTemplateColumns:'repeat(7,1fr)',gap:3,marginBottom:3}}>
+            {['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(d=><div key={d} style={{fontSize:11,fontWeight:600,color:'#9CA3AF',textAlign:'center',padding:'4px 0'}}>{d}</div>)}
+          </div>
+          <div style={{display:'grid',gridTemplateColumns:'repeat(7,1fr)',gap:3}}>
+            {Array.from({length:firstDow}).map((_,i)=><div key={`e${i}`}/>)}
+            {Array.from({length:daysInM}).map((_,i)=>{
+              const day=i+1,ds=`${calY}-${String(calM+1).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+              const d=getDayData(ds),ps=d?PH[d.phase]:null;
+              const isToday=ds===TODAY,isSel=ds===selDate,isExam=d?.special==='exam'||d?.special==='exam_opt';
+              return (
+                <div key={day} onClick={()=>{if(d){setSelDate(ds);setView('today');}}}
+                  style={{minHeight:68,borderRadius:10,padding:'6px 7px',cursor:d?'pointer':'default',background:isSel?'#111827':ps?ps.bg:'#F9FAFB',border:isToday?`2px solid ${ps?.accent||'#F97316'}`:isExam?`2px solid ${ps?.accent}`:'1px solid transparent',opacity:d?1:0.25,transition:'all .12s'}}>
+                  <div style={{fontSize:11,fontWeight:isToday?700:500,color:isSel?'#fff':'#374151',marginBottom:2}}>{day}</div>
+                  {d&&<><div style={{fontSize:9,color:isSel?'#D1D5DB':ps.accent,lineHeight:1.3,marginBottom:3,fontWeight:500}}>{d.system?.substring(0,14)}</div>
+                  <div style={{display:'flex',gap:2,flexWrap:'wrap'}}>
+                    {isExam&&<span style={{fontSize:8,background:'#F97316',color:'#fff',borderRadius:4,padding:'1px 4px',fontWeight:700}}>EXAM</span>}
+                    {d.is_lce&&<span style={{fontSize:8,background:'#10B981',color:'#fff',borderRadius:4,padding:'1px 4px',fontWeight:700}}>LCE</span>}
+                    {d.special==='flight'&&<span style={{fontSize:8,background:'#3B82F6',color:'#fff',borderRadius:4,padding:'1px 4px',fontWeight:700}}>✈</span>}
+                    {d.special==='review'&&<span style={{fontSize:8,background:'#8B5CF6',color:'#fff',borderRadius:4,padding:'1px 4px',fontWeight:700}}>REV</span>}
+                  </div></>}
+                </div>
+              );
+            })}
+          </div>
+          <div style={{display:'flex',gap:12,marginTop:14,flexWrap:'wrap'}}>
+            {Object.entries(PH).map(([k,p])=>(<div key={k} style={{display:'flex',alignItems:'center',gap:5,fontSize:11,color:'#6B7280'}}><div style={{width:10,height:10,borderRadius:3,background:p.bg,border:`1.5px solid ${p.accent}`}}/> Phase {k}: {p.name}</div>))}
+          </div>
+        </div>
+      )}
+
+      {view==='scores'&&(
+        <div style={{maxWidth:600,margin:'0 auto',padding:'24px 20px'}}>
+          <div style={{fontSize:22,fontWeight:700,letterSpacing:'-0.02em',marginBottom:20}}>Score tracker</div>
+          <NBMETracker/>
+        </div>
+      )}
+
+      {view==='progress'&&(
+        <div style={{maxWidth:800,margin:'0 auto',padding:'24px 20px',display:'flex',flexDirection:'column',gap:16}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+            <div style={{fontSize:22,fontWeight:700,letterSpacing:'-0.02em'}}>Progress</div>
+            <button onClick={()=>exportCSV(allLogs)} style={{...btnSm('#F3F4F6','#374151'),fontSize:12,fontWeight:600}}>↓ Export CSV</button>
+          </div>
+          <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:10}}>
+            {[['Hours logged',totalHrs.toFixed(1),'of ~362 projected'],['Anki cards',totalAnki.toLocaleString(),'total reviewed'],['Pomodoros',totalPoms,'50-min sessions'],['Days to exam',dtg,'Jun 12, 2026']].map(([lbl,val,sub])=>(
+              <div key={lbl} style={{background:'#fff',borderRadius:12,padding:'14px 16px',border:'1px solid #E5E7EB'}}>
+                <div style={{fontSize:11,color:'#9CA3AF',fontWeight:600,textTransform:'uppercase',letterSpacing:'0.06em',marginBottom:4}}>{lbl}</div>
+                <div style={{fontSize:26,fontWeight:700,letterSpacing:'-0.02em',color:'#111827',fontVariantNumeric:'tabular-nums'}}>{val}</div>
+                <div style={{fontSize:11,color:'#9CA3AF',marginTop:2}}>{sub}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{background:'#fff',borderRadius:14,border:'1px solid #E5E7EB',padding:'16px 20px'}}>
+            <div style={{display:'flex',justifyContent:'space-between',marginBottom:8}}>
+              <span style={{fontSize:12,fontWeight:600,color:'#374151'}}>Hours toward 362</span>
+              <span style={{fontSize:12,fontWeight:700,color:'#F97316'}}>{((totalHrs/362)*100).toFixed(1)}%</span>
+            </div>
+            <div style={{height:8,background:'#F3F4F6',borderRadius:4,overflow:'hidden'}}>
+              <div style={{height:'100%',width:`${Math.min((totalHrs/362)*100,100)}%`,background:'#F97316',borderRadius:4,transition:'width .5s'}}/>
+            </div>
+          </div>
+          {allLogs.length>0&&(
+            <div style={{background:'#fff',borderRadius:14,border:'1px solid #E5E7EB',padding:'16px 20px'}}>
+              <div style={{fontSize:12,fontWeight:600,color:'#374151',marginBottom:12}}>Daily hours — last 30 days</div>
+              <div style={{display:'flex',alignItems:'flex-end',gap:3,height:80}}>
+                {allLogs.slice(-30).map(log=>{const h=log.hours_studied||0,pct=Math.min((h/10)*100,100),d=getDayData(log.date),ps=d?PH[d.phase]:PH[1];return <div key={log.date} title={`${log.date}: ${h}h`} style={{flex:1,display:'flex',flexDirection:'column',justifyContent:'flex-end',minWidth:6}}><div style={{height:`${pct}%`,background:ps.accent,borderRadius:'2px 2px 0 0',opacity:.8,minHeight:h>0?3:0}}/></div>;})}
+              </div>
+            </div>
+          )}
+          <div style={{background:'#fff',borderRadius:14,border:'1px solid #E5E7EB',padding:20,display:'flex',alignItems:'center',gap:20}}>
+            <div style={{width:90,height:90,flexShrink:0}}><StaghornFern pomodoroCount={totalPoms}/></div>
+            <div>
+              <div style={{fontSize:14,fontWeight:600,marginBottom:4}}>The staghorn fern at Koidu Government Hospital</div>
+              <div style={{fontSize:12,color:'#9CA3AF',lineHeight:1.6}}>{totalPoms} focus sessions · {totalPoms*50} minutes · {totalPoms>=26?'Fully grown.':26-totalPoms+' sessions until full growth.'}</div>
+            </div>
+          </div>
+          {allLogs.length>0&&(
+            <div style={{background:'#fff',borderRadius:14,border:'1px solid #E5E7EB',padding:'16px 20px'}}>
+              <div style={{fontSize:12,fontWeight:600,color:'#374151',marginBottom:12}}>Recent log entries</div>
+              <div style={{display:'flex',flexDirection:'column',gap:6}}>
+                {allLogs.slice(-7).reverse().map(log=>(
+                  <div key={log.date} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 0',borderBottom:'1px solid #F9FAFB'}}>
+                    <div><span style={{fontSize:13,fontWeight:600,color:'#111827'}}>{fmtShort(log.date)}</span>{log.notes&&<span style={{fontSize:12,color:'#9CA3AF',marginLeft:8}}>{log.notes.substring(0,50)}{log.notes.length>50?'...':''}</span>}</div>
+                    <div style={{display:'flex',gap:12,fontSize:12,color:'#6B7280',fontVariantNumeric:'tabular-nums'}}>
+                      {log.hours_studied>0&&<span>{log.hours_studied}h</span>}{log.anki_cards>0&&<span>{log.anki_cards} anki</span>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');*{box-sizing:border-box;}button:active{transform:scale(0.97);}input:focus,textarea:focus,select:focus{border-color:#F97316!important;box-shadow:0 0 0 3px #FFF7ED;}a:hover{opacity:0.8;}`}</style>
+    </div>
   );
 }
