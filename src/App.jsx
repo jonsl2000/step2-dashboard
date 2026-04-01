@@ -5,8 +5,8 @@ import { getDailyLog, upsertDailyLog, getTaskCompletions, toggleTaskCompletion, 
 import StaghornFern from './components/StaghornFern';
 import PomodoroTimer from './components/PomodoroTimer';
 import WeakTopics from './components/WeakTopics';
-import UWorldAggregate from ./components/UWorldAggregate.jsx.;
-import AmbossTracker from ./components/AmbossTracker.jsx.;
+
+
 import UWorldPerformance from './components/UWorldPerformance';
 import UWorldAggregate from './components/UWorldAggregate.jsx';
 import AmbossTracker from './components/AmbossTracker.jsx';
