@@ -503,6 +503,8 @@ export default function App() {
       {view === 'scores' && (
         <div style={{ maxWidth:680, margin:'0 auto', padding:'24px 20px', display:'flex', flexDirection:'column', gap:20 }}>
           <div style={{ fontSize:22, fontWeight:700, letterSpacing:'-0.02em' }}>Score tracker</div>
+          <UWorldAggregate/>
+          <AmbossTracker/>
           <ScorePredictor scores={scores} />
           <NBMETracker />
           <UWorldPerformance />
