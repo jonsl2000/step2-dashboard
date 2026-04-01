@@ -70,3 +70,14 @@ export async function getAllPomodoros() {
   if (error) console.error(error);
   return data || [];
 }
+
+export async function getDailyMood(date) {
+  const { data, error } = await supabase.from('daily_mood').select('*').eq('date', date).single();
+  if (error && error.code !== 'PGRST116') console.error(error);
+  return data;
+}
+export async function upsertDailyMood(date, energy) {
+  const { data, error } = await supabase.from('daily_mood').upsert({ date, energy }, { onConflict: 'date' }).select().single();
+  if (error) console.error(error);
+  return data;
+}
